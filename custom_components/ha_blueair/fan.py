@@ -8,12 +8,16 @@ from homeassistant.components.fan import (
     FanEntityFeature,
 )
 
-from blueair_api import AP_SUB_MODE_LABELS
+from homeassistant.util.percentage import (
+    ordered_list_item_to_percentage,
+    percentage_to_ordered_list_item,
+)
 
 from .blueair_update_coordinator import BlueairUpdateCoordinator
 from .const import (
     DEFAULT_FAN_SPEED_PERCENTAGE,
     MODE_AUTO,
+    MODE_ECO,
     MODE_MANUAL_FAN,
     MODE_NIGHT,
 )
@@ -23,20 +27,39 @@ from .entity import BlueairEntity, async_setup_entry_helper
 
 _LOGGER = logging.getLogger(__name__)
 
-# Reverse lookup for AP_SUB_MODE_LABELS: HA preset label -> apsubmode
-# wire value. Built once at import time; the library guarantees keys
-# are ints and values are unique (see test_labels_are_unique).
+# `apsubmode` values for Signature-series purifiers (blue40). These
+# match the official Blueair app's `ApSubMode` enum
+# (FAN=1, AUTO=2, NIGHT=3, ECO=4). There is no 0: the previous mapping
+# (manual_fan=0, from blueair_api.AP_SUB_MODE_LABELS) is not a value the
+# app ever writes, and the device ignores it (it stays in its current
+# mode) while the cloud state store still records 0.
+_SIGNATURE_AP_SUB_MODE_TO_LABEL: dict[int, str] = {
+    1: MODE_MANUAL_FAN,
+    2: MODE_AUTO,
+    3: MODE_NIGHT,
+    4: MODE_ECO,
+}
 _LABEL_TO_AP_SUB_MODE: dict[str, int] = {
-    label: value for value, label in AP_SUB_MODE_LABELS.items()
+    label: value for value, label in _SIGNATURE_AP_SUB_MODE_TO_LABEL.items()
 }
 
-# Investigation of the Blueair cloud API responses and AWS IoT
-# protocol behavior shows that Signature-family devices pair every
-# `apsubmode` write with a `fanspeed` reset to this value (the
-# device's lowest manual speed). Mirroring the pattern keeps the
-# device's stored manual fan speed at a known low value, so
-# returning to manual_fan later starts at a predictable speed.
-_SIGNATURE_APSUBMODE_FANSPEED_RESET = 11
+# Manual fan gears (the raw `fanspeed` values the official app writes)
+# per Signature hardware id. Large/medium units use four gears, the
+# small unit three. Values between gears are what the device reports
+# while it is choosing its own speed in auto/night/eco.
+_SIGNATURE_FAN_GEARS: dict[str, list[int]] = {
+    "l_blue40": [11, 37, 64, 91],
+    "m_blue40": [11, 37, 64, 91],
+    "b40m": [11, 37, 64, 91],
+    "b40s": [11, 51, 91],
+}
+_SIGNATURE_DEFAULT_FAN_GEARS = [11, 37, 64, 91]
+
+# Delay after changing apsubmode before writing a manual fan speed, so
+# the device has applied the mode (it restores its own stored speed on
+# the mode change) before our speed arrives. Same pattern as the legacy
+# night-mode path below.
+_SIGNATURE_MODE_SETTLE_SECONDS = 2
 
 # 2-in-1 combo devices (e.g. DH3i) expose a single `mode` field whose
 # value selects the operating preset. The mapping follows the device
@@ -211,7 +234,7 @@ class BlueairAwsFan(BlueairEntity, FanEntity):
                 "(model=%s, presets=%s)",
                 getattr(coordinator.blueair_api_device, "uuid", "?"),
                 coordinator.model,
-                list(AP_SUB_MODE_LABELS.values()),
+                list(_SIGNATURE_AP_SUB_MODE_TO_LABEL.values()),
             )
 
         if self._combo_presets:
@@ -225,9 +248,8 @@ class BlueairAwsFan(BlueairEntity, FanEntity):
 
         self._attr_preset_modes = []
         if self._signature_presets:
-            # Signature devices: four presets derived from
-            # AP_SUB_MODE_LABELS (manual_fan / auto / night / eco).
-            self._attr_preset_modes = list(AP_SUB_MODE_LABELS.values())
+            # Signature devices: manual_fan / auto / night / eco.
+            self._attr_preset_modes = list(_SIGNATURE_AP_SUB_MODE_TO_LABEL.values())
         elif self._combo_presets:
             # 2-in-1 combo devices: Manual / Auto / Night via combo_mode.
             self._attr_preset_modes = list(_COMBO_MODE_TO_LABEL.values())
@@ -249,27 +271,43 @@ class BlueairAwsFan(BlueairEntity, FanEntity):
     def is_on(self) -> int:
         return self.coordinator.is_on
 
+    def _signature_ap_sub_mode(self) -> int | None:
+        """Current apsubmode as an int, or None if unknown/unparseable."""
+        ap_sub_mode = self.coordinator.ap_sub_mode
+        if ap_sub_mode in (None, NotImplemented):
+            return None
+        try:
+            return int(ap_sub_mode)
+        except (TypeError, ValueError):
+            return None
+
+    def _signature_fan_gears(self) -> list[int]:
+        hw = getattr(self.coordinator.blueair_api_device, "hw", None)
+        if isinstance(hw, str):
+            gears = _SIGNATURE_FAN_GEARS.get(hw.lower())
+            if gears is not None:
+                return gears
+        return _SIGNATURE_DEFAULT_FAN_GEARS
+
     @property
     def percentage(self) -> int | None:
         """Return the current speed percentage."""
         if self._signature_presets:
-            # On Signature devices the user only sees a meaningful speed
-            # value while in manual_fan (apsubmode=0). In auto/night/eco
-            # the device picks the speed and the percentage UI is
-            # actively misleading.
-            ap_sub_mode = self.coordinator.ap_sub_mode
-            if ap_sub_mode in (None, NotImplemented):
-                manual = True
-            else:
-                try:
-                    manual = int(ap_sub_mode) == _LABEL_TO_AP_SUB_MODE[MODE_MANUAL_FAN]
-                except (TypeError, ValueError):
-                    manual = True
-            if not manual:
+            # Only meaningful in manual_fan (apsubmode=1). In
+            # auto/night/eco the device picks its own (stepless) speed.
+            if self._signature_ap_sub_mode() != _LABEL_TO_AP_SUB_MODE[MODE_MANUAL_FAN]:
                 return None
-            if self.coordinator.fan_speed in (None, NotImplemented):
+            fan_speed = self.coordinator.fan_speed
+            if fan_speed in (None, NotImplemented):
                 return None
-            return int((self.coordinator.fan_speed * 100) // self.coordinator.speed_count)
+            gears = self._signature_fan_gears()
+            # Bucket the raw value onto the highest gear it has reached,
+            # as the official app does.
+            gear = gears[0]
+            for candidate in gears:
+                if fan_speed >= candidate:
+                    gear = candidate
+            return ordered_list_item_to_percentage(gears, gear)
 
         if self._combo_presets:
             # The speed slider is only meaningful in Manual; in
@@ -296,22 +334,20 @@ class BlueairAwsFan(BlueairEntity, FanEntity):
 
     async def async_set_percentage(self, percentage: int) -> None:
         if self._signature_presets:
-            # Switch into manual_fan first so the device honors the
-            # percentage write. Skipped if already there to avoid an
-            # extraneous shadow write on every speed change.
+            if percentage == 0:
+                await self.async_turn_off()
+                return
+            # The device only honors a manual speed in manual_fan
+            # (apsubmode=1), so switch there first. Skipped if already
+            # there to avoid an extraneous write on every speed change.
             manual_value = _LABEL_TO_AP_SUB_MODE[MODE_MANUAL_FAN]
-            ap_sub_mode = self.coordinator.ap_sub_mode
-            try:
-                already_manual = (
-                    ap_sub_mode not in (None, NotImplemented)
-                    and int(ap_sub_mode) == manual_value
-                )
-            except (TypeError, ValueError):
-                already_manual = False
-            if not already_manual:
+            if self._signature_ap_sub_mode() != manual_value:
                 await self.coordinator.set_ap_sub_mode(manual_value)
-            blueair_percentage = int(round(percentage / 100 * self.coordinator.speed_count))
-            await self.coordinator.set_fan_speed(blueair_percentage)
+                await sleep(_SIGNATURE_MODE_SETTLE_SECONDS)
+            # Write one of the device's discrete gears (what the app
+            # writes), not a 0-100 value.
+            gear = percentage_to_ordered_list_item(self._signature_fan_gears(), percentage)
+            await self.coordinator.set_fan_speed(gear)
             self.async_write_ha_state()
             return
 
@@ -362,14 +398,12 @@ class BlueairAwsFan(BlueairEntity, FanEntity):
                     preset_mode, list(_LABEL_TO_AP_SUB_MODE),
                 )
                 return
+            # The official app sends apsubmode alone for Signature
+            # devices; it never pairs it with a fanspeed write (its
+            # fanspeed=11 is only a local cache update). A fanspeed write
+            # here would at best be ignored and at worst knock the
+            # device out of the preset just selected.
             await self.coordinator.set_ap_sub_mode(value)
-            # Investigation of the Blueair cloud API responses and AWS
-            # IoT protocol behavior shows that apsubmode writes on
-            # Signature-family devices are paired with a fanspeed
-            # reset (see _SIGNATURE_APSUBMODE_FANSPEED_RESET docstring).
-            # The slider is hidden in non-manual presets, so this write
-            # is invisible while the preset is active.
-            await self.coordinator.set_fan_speed(_SIGNATURE_APSUBMODE_FANSPEED_RESET)
             self.async_write_ha_state()
             return
 
@@ -406,6 +440,11 @@ class BlueairAwsFan(BlueairEntity, FanEntity):
     ) -> None:
         if self.is_on is False:
             await self.coordinator.set_running(True)
+        if self._signature_presets and percentage is None and preset_mode is None:
+            # Signature devices resume their previous mode on power-up;
+            # don't force them out of auto/night/eco into manual.
+            self.async_write_ha_state()
+            return
         if percentage is None:
             # FIXME: i35 (and probably others) do not remember the
             # last fan speed and always set the speed to 0. I don't know
@@ -423,19 +462,21 @@ class BlueairAwsFan(BlueairEntity, FanEntity):
     @property
     def speed_count(self) -> int:
         """Return the number of speeds the fan supports."""
+        if self._signature_presets:
+            return len(self._signature_fan_gears())
         return self.coordinator.speed_count
 
     @property
     def preset_mode(self) -> str | None:
         """Return the current preset mode, e.g., auto, smart, interval, favorite."""
         if self._signature_presets:
-            ap_sub_mode = self.coordinator.ap_sub_mode
-            if ap_sub_mode in (None, NotImplemented):
+            # Unknown values (including a stale 0 written by earlier
+            # versions of this integration) map to no preset rather
+            # than being reported as manual.
+            ap_sub_mode = self._signature_ap_sub_mode()
+            if ap_sub_mode is None:
                 return None
-            try:
-                return AP_SUB_MODE_LABELS.get(int(ap_sub_mode))
-            except (TypeError, ValueError):
-                return None
+            return _SIGNATURE_AP_SUB_MODE_TO_LABEL.get(ap_sub_mode)
 
         if self._combo_presets:
             combo_mode = self.coordinator.combo_mode
